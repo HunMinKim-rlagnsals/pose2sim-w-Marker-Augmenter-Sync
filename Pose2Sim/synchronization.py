@@ -287,7 +287,7 @@ def update_play(cap, image, slider, frame_to_json, pose_dir, json_dir_name, rect
     fig.canvas.draw_idle()
 
 
-def get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json_files_names_range, search_around_frames, pose_dir, json_dirs_names):
+def get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json_files_names_range, search_around_frames, pose_dir, json_dirs_names, is_manual=False):
     '''
     Allows the user to select a person from each camera by clicking on their bounding box in the video frames.
 
@@ -300,26 +300,34 @@ def get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json
     - search_around_frames: list of tuples. Each tuple contains (start_frame, end_frame) for searching frames.
     - pose_dir: str. Path to the directory containing pose data.
     - json_dirs_names: list of str. Names of the JSON directories for each camera.
-
+    - is_manual: bool. If True, allows selecting start frame for synchronization.
     OUTPUTS:
     - selected_id_list: list of int or None. List of the selected person indices for each camera.
+    - start_frames: list of int or None. List of selected start frames for each camera when is_manual is True.
     '''
+    
     if not multi_person:
-        return [None] * cam_nb
+        return [None] * cam_nb, None
 
     else:
-        logging.info('Multi_person mode: selecting the person to synchronize on for each camera.')
+        if is_manual:
+            logging.info('Multi_person mode: selecting the person to synchronize on for each camera.\nThe frame where you select the person will be used as the start frame for synchronization.')
+        else:
+            logging.info('Multi_person mode: selecting the person to synchronize on for each camera.')
         selected_id_list = []
+        start_frames = [] if is_manual else None
         try: # video files
-            video_files_dict = {cam_name: file for cam_name in cam_names for file in vid_or_img_files if cam_name in os.path.basename(file)}
-        except: # image directories
-            video_files_dict = {cam_name: files for cam_name in cam_names for files in vid_or_img_files if cam_name in os.path.basename(files[0])}
+            video_files_dict = {cam_name: file for cam_name, file in zip(cam_names, vid_or_img_files)}
+        except: # image directories 
+            video_files_dict = {cam_name: files for cam_name, files in zip(cam_names, vid_or_img_files)}
 
         for i, cam_name in enumerate(cam_names):
             vid_or_img_files_cam = video_files_dict.get(cam_name)
             if not vid_or_img_files_cam:
                 logging.warning(f'No video file nor image directory found for camera {cam_name}')
                 selected_id_list.append(None)
+                if is_manual:
+                    start_frames.append(None)
                 continue
             try:
                 cap = cv2.VideoCapture(vid_or_img_files_cam)
@@ -335,6 +343,8 @@ def get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json
             if frame_rgb is None:
                 logging.warning(f'Cannot read frame {frame_number} from video {vid_or_img_files_cam}')
                 selected_id_list.append(None)
+                if is_manual:
+                    start_frames.append(None)
                 if isinstance(cap, cv2.VideoCapture):
                     cap.release()
                 continue
@@ -345,7 +355,11 @@ def get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json
 
             fig, ax = plt.subplots(figsize=(fig_width, fig_height))
             ax.imshow(frame_rgb)
-            ax.set_title(f'{cam_name}: select the person to synchronize on', fontsize=10, color='black', pad=15)
+            if is_manual:
+                title_text = f'{cam_name}: select person and start frame for synchronization'
+                ax.set_title(title_text, fontsize=12, color='black', pad=15)
+            else:
+                ax.set_title(f'{cam_name}: select the person to synchronize on', fontsize=10, color='black', pad=15)
             ax.axis('off')
 
             rects, annotations = [], []
@@ -378,10 +392,14 @@ def get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json
                 selected_idx_container[0] = 0
                 logging.warning(f'No person selected for camera {cam_name}: defaulting to person 0')
             selected_id_list.append(selected_idx_container[0])
-            logging.info(f'--> Camera #{i}: selected person #{selected_idx_container[0]}')
+            
+            current_frame = int(slider.val)
+            if is_manual:
+                start_frames.append(current_frame)
+                logging.info(f'--> Camera #{i}: selected person #{selected_idx_container[0]} at frame #{current_frame}')
         logging.info('')
 
-        return selected_id_list
+        return selected_id_list, start_frames if is_manual else None
 
 
 def convert_json2pandas(json_files, likelihood_threshold=0.6, keypoints_ids=[], multi_person=False, selected_id=None):
@@ -618,7 +636,7 @@ def synchronize_cams_all(config_dict):
             fps = round(cap.get(cv2.CAP_PROP_FPS))
         except:
             fps = 60  
-    lag_range = time_range_around_maxspeed*fps # frames
+    lag_range = int(time_range_around_maxspeed*fps) # frames
 
     # Retrieve keypoints from model
     try: # from skeletons.py
@@ -654,8 +672,7 @@ def synchronize_cams_all(config_dict):
     nb_frames_per_cam = [len(fnmatch.filter(os.listdir(os.path.join(json_dir)), '*.json')) for json_dir in json_dirs]
     cam_nb = len(json_dirs)
     cam_list = list(range(cam_nb))
-    cam_names = [os.path.basename(j_dir).split('_')[0] for j_dir in json_dirs]
-    
+    cam_names = [next((part for part in os.path.basename(j_dir).split('_') if 'cam' in part.lower()), os.path.basename(j_dir)) for j_dir in json_dirs]
     # frame range selection
     f_range = [[0, min([len(j) for j in json_files_names])] if frame_range==[] else frame_range][0]
     # json_files_names = [[j for j in json_files_cam if int(re.split(r'(\d+)',j)[-2]) in range(*f_range)] for json_files_cam in json_files_names]
@@ -669,8 +686,12 @@ def synchronize_cams_all(config_dict):
     elif approx_time_maxspeed == 'auto': # search on the whole sequence (slower if long sequence)
         search_around_frames = [[f_range[0], f_range[0]+nb_frames_per_cam[i]] for i in range(cam_nb)]
         logging.info('Synchronization is calculated on the whole sequence. This may take a while.')
+    elif approx_time_maxspeed == 'manual':
+        is_manual = True
+        search_around_frames = [[f_range[0], f_range[0]+nb_frames_per_cam[i]] for i in range(cam_nb)]
+        logging.info('Synchronization is calculated on the manually selected frames.')
     else:
-        raise ValueError('approx_time_maxspeed should be a list of floats or "auto"')
+        raise ValueError('approx_time_maxspeed should be a list of floats or "auto" or "manual"')
     
     if keypoints_to_consider == 'right':
         logging.info(f'Keypoints used to compute the best synchronization offset: right side.')
@@ -689,12 +710,27 @@ def synchronize_cams_all(config_dict):
     b, a = signal.butter(filter_order/2, filter_cutoff/(fps/2), 'low', analog = False) 
     json_files_names_range = [[j for j in json_files_cam if int(re.split(r'(\d+)',j)[-2]) in range(*frames_cam)] for (json_files_cam, frames_cam) in zip(json_files_names,search_around_frames)]
     json_files_range = [[os.path.join(pose_dir, j_dir, j_file) for j_file in json_files_names_range[j]] for j, j_dir in enumerate(json_dirs_names)]
-    
     if np.array([j==[] for j in json_files_names_range]).any():
         raise ValueError(f'No json files found within the specified frame range ({frame_range}) at the times {approx_time_maxspeed} +/- {time_range_around_maxspeed} s.')
     
     # Handle manual selection if multi person is True
-    selected_id_list = get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json_files_names_range, search_around_frames, pose_dir, json_dirs_names)
+    selected_id_list, start_frames = get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json_files_names_range, search_around_frames, pose_dir, json_dirs_names, is_manual=is_manual)
+    
+    if is_manual:
+        # Convert selected frames to time points
+        approx_time_maxspeed = [frame / fps for frame in start_frames]
+        print(f"approx_time_maxspeed: {approx_time_maxspeed}")
+        # Recalculate frame ranges based on new time points
+        approx_frame_maxspeed = [int(fps * t) for t in approx_time_maxspeed]
+        search_around_frames = [[int(a-lag_range) if a-lag_range>0 else 0, int(a+lag_range) if a+lag_range<nb_frames_per_cam[i] else nb_frames_per_cam[i]+f_range[0]] for i,a in enumerate(approx_frame_maxspeed)]
+        # Recalculate json files range based on new search_around_frames
+        json_files_names_range = [[j for j in json_files_cam if int(re.split(r'(\d+)',j)[-2]) in range(*frames_cam)] for (json_files_cam, frames_cam) in zip(json_files_names,search_around_frames)]
+        # print(f"json_files_names_range: {json_files_names_range}")
+        json_files_range = [[os.path.join(pose_dir, j_dir, j_file) for j_file in json_files_names_range[j]] for j, j_dir in enumerate(json_dirs_names)]
+        # print(f"json_files_range: {json_files_range}")
+        if np.array([j==[] for j in json_files_names_range]).any():
+            raise ValueError(f'No json files found within the specified frame range around manually selected frames.')
+        logging.info('Recalculated frame ranges based on manually selected frames.')
 
     for i in range(cam_nb):
         df_coords.append(convert_json2pandas(json_files_range[i], likelihood_threshold=likelihood_threshold, keypoints_ids=keypoints_ids, multi_person=multi_person, selected_id=selected_id_list[i]))
