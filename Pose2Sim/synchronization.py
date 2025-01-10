@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 import cv2
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
+from matplotlib.widgets import Slider, TextBox
 from matplotlib import patheffects
 from scipy import signal
 from scipy import interpolate
@@ -372,17 +372,44 @@ def get_selected_id_list(multi_person, vid_or_img_files, cam_names, cam_nb, json
             fig.canvas.mpl_connect('button_press_event', lambda event: on_click(event, ax, bounding_boxes_list, selected_idx_container))
 
             # Add slider
-            ax_slider = plt.axes([ax.get_position().x0, 0.05, ax.get_position().width, 0.05])
-            slider = Slider(ax_slider, 'Frame ', search_around_frames[i][0], search_around_frames[i][1] - 1, valinit=frame_number, valfmt='%0.0f')
+            ax_slider = plt.axes([ax.get_position().x0, 0.05, ax.get_position().width - 0.112, 0.05])
+            slider = Slider(ax_slider, '', search_around_frames[i][0], search_around_frames[i][1] - 1, valfmt='%s')
+
+            # Add text box for frame number
+            ax_text = plt.axes([ax.get_position().x0 + ax.get_position().width - 0.087, 0.06, 0.04, 0.03])
+            text_box = TextBox(ax_text, 'Frame', initial=str(int(search_around_frames[i][0])))
+
+            # Add arrow buttons
+            ax_prev = plt.axes([ax.get_position().x0 + ax.get_position().width - 0.044, 0.06, 0.02, 0.03])
+            ax_next = plt.axes([ax.get_position().x0 + ax.get_position().width - 0.021, 0.06, 0.02, 0.03])
+            btn_prev = plt.Button(ax_prev, '<')
+            btn_next = plt.Button(ax_next, '>')
 
             # Customize slider
-            slider.label.set_fontsize(10)
             slider.poly.set_edgecolor((0, 0, 0, 0.5))
             slider.poly.set_facecolor('lightblue')
             slider.poly.set_linewidth(1)
+            slider.valtext.set_visible(False)  # Hide the value text
 
-            # Connect the update function to the slider
-            slider.on_changed(lambda val: update_play(cap, ax.images[0], slider, frame_to_json, pose_dir, json_dirs_names[i], rects, annotations, bounding_boxes_list, ax, fig))
+            # Connect slider to update_play and text box
+            slider.on_changed(lambda val: (text_box.set_val(str(int(val))), 
+                              update_play(cap, ax.images[0], slider, frame_to_json, pose_dir, json_dirs_names[i], 
+                                        rects, annotations, bounding_boxes_list, ax, fig)))
+
+            # Connect text box to slider
+            text_box.on_submit(lambda text: slider.set_val(int(text)) if text.isdigit() and 
+                             search_around_frames[i][0] <= int(text) <= search_around_frames[i][1] - 1 
+                             else text_box.set_val(str(int(slider.val))))
+
+            # Connect arrow buttons and keyboard events
+            btn_prev.on_clicked(lambda event: slider.set_val(int(slider.val) - 1) 
+                              if search_around_frames[i][0] <= int(slider.val) - 1 else None)
+            btn_next.on_clicked(lambda event: slider.set_val(int(slider.val) + 1) 
+                              if int(slider.val) + 1 <= search_around_frames[i][1] - 1 else None)
+            fig.canvas.mpl_connect('key_press_event', lambda event: 
+                                 slider.set_val(int(slider.val) - 1) if event.key == 'left' and search_around_frames[i][0] <= int(slider.val) - 1
+                                 else slider.set_val(int(slider.val) + 1) if event.key == 'right' and int(slider.val) + 1 <= search_around_frames[i][1] - 1
+                                 else None)
 
             # Show the plot and handle events
             plt.show()
@@ -545,7 +572,10 @@ def time_lagged_cross_corr(camx, camy, lag_range, show=True, ref_cam_name='0', c
         lag_range = [-lag_range, lag_range]
 
     pearson_r = [camx.corr(camy.shift(lag)) for lag in range(lag_range[0], lag_range[1])]
-    offset = int(np.argmax(pearson_r)-np.floor(len(pearson_r)/2))
+    print(f"np.floor(len(pearson_r)/2): {np.floor(len(pearson_r)/2)}")
+    print(f"np.argmax(pearson_r): {np.argmax(pearson_r)}")
+    # offset = int(np.argmax(pearson_r)-np.floor(len(pearson_r)/2)) # After update
+    offset = int(np.floor(len(pearson_r)/2)-np.argmax(pearson_r)) # Before update
 
     if not np.isnan(pearson_r).all():
         max_corr = np.nanmax(pearson_r)
