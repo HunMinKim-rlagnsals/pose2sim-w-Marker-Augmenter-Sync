@@ -933,3 +933,117 @@ def compute_height(Q_coords, keypoints_names, fastest_frames_to_remove_percent=0
 
     return height
 
+
+def sort_people_convexhull(keyptpre, keypt, scores=None):
+    '''
+    Associate persons across frames using Convex Hull method.
+    Each person is assigned a unique convex hull, which is tracked across frames.
+    New persons are assigned new unique convex hulls.
+    
+    INPUTS:
+    - keyptpre: (K, L, M) array of 2D coordinates for K persons in the previous frame, L keypoints, M 2D coordinates
+    - keypt: idem keyptpre, for current frame
+    - score: (K, L) array of confidence scores for K persons, L keypoints (optional) 
+    
+    OUTPUTS:
+    - sorted_prev_keypoints: array with reordered persons with values of previous frame if current is empty
+    - sorted_keypoints: array with reordered persons --> if scores is not None
+    - sorted_scores: array with reordered scores     --> if scores is not None
+    - associated_tuples: list of tuples with correspondences between persons across frames --> if scores is None
+    '''
+    from scipy.spatial import ConvexHull
+    
+    # Generate possible person correspondences across frames
+    max_len = max(len(keyptpre), len(keypt))
+    keyptpre = pad_shape(keyptpre, max_len, fill_value=np.nan)
+    keypt = pad_shape(keypt, max_len, fill_value=np.nan)
+    if scores is not None:
+        scores = pad_shape(scores, max_len, fill_value=np.nan)
+    
+    # Compute convex hulls for each person in both frames
+    hulls_pre = []
+    hulls_cur = []
+    
+    # Previous frame hulls
+    for person in keyptpre:
+        valid_points = person[~np.isnan(person).any(axis=1)]
+        if len(valid_points) >= 3:  # Need at least 3 points for convex hull
+            try:
+                hull = ConvexHull(valid_points)
+                hulls_pre.append({
+                    'points': valid_points[hull.vertices],
+                    'center': np.mean(valid_points[hull.vertices], axis=0),
+                    'area': hull.area
+                })
+            except:
+                hulls_pre.append(None)
+        else:
+            hulls_pre.append(None)
+    
+    # Current frame hulls
+    for person in keypt:
+        valid_points = person[~np.isnan(person).any(axis=1)]
+        if len(valid_points) >= 3:
+            try:
+                hull = ConvexHull(valid_points)
+                hulls_cur.append({
+                    'points': valid_points[hull.vertices],
+                    'center': np.mean(valid_points[hull.vertices], axis=0),
+                    'area': hull.area
+                })
+            except:
+                hulls_cur.append(None)
+        else:
+            hulls_cur.append(None)
+    
+    # Compute distances between hull centers and area differences
+    personsIDs_comb = sorted(list(it.product(range(len(keyptpre)), range(len(keypt)))))
+    frame_by_frame_dist = []
+    
+    for comb in personsIDs_comb:
+        hull_pre = hulls_pre[comb[0]]
+        hull_cur = hulls_cur[comb[1]]
+        
+        if hull_pre is None or hull_cur is None:
+            frame_by_frame_dist.append(np.inf)
+            continue
+        
+        # Compute center distance and area difference
+        center_dist = euclidean_distance(hull_pre['center'], hull_cur['center'])
+        area_diff = abs(hull_pre['area'] - hull_cur['area']) / max(hull_pre['area'], hull_cur['area'])
+        
+        # Combined metric (weighted sum of center distance and area difference)
+        combined_dist = center_dist + area_diff * 100  # Weight for area difference
+        frame_by_frame_dist.append(combined_dist)
+    
+    # Sort correspondences by distance
+    _, _, associated_tuples = min_with_single_indices(frame_by_frame_dist, personsIDs_comb)
+    
+    # Associate points to same index across frames, nan if no correspondence
+    sorted_keypoints = []
+    for i in range(len(keyptpre)):
+        id_in_old = associated_tuples[:,1][associated_tuples[:,0] == i].tolist()
+        if len(id_in_old) > 0:
+            sorted_keypoints += [keypt[id_in_old[0]]]
+        else:
+            sorted_keypoints += [keypt[i]]
+    sorted_keypoints = np.array(sorted_keypoints)
+
+    if scores is not None:
+        sorted_scores = []
+        for i in range(len(keyptpre)):
+            id_in_old = associated_tuples[:,1][associated_tuples[:,0] == i].tolist()
+            if len(id_in_old) > 0:
+                sorted_scores += [scores[id_in_old[0]]]
+            else:
+                sorted_scores += [scores[i]]
+        sorted_scores = np.array(sorted_scores)
+
+    # Keep track of previous values even when missing for more than one frame
+    sorted_prev_keypoints = np.where(np.isnan(sorted_keypoints) & ~np.isnan(keyptpre), keyptpre, sorted_keypoints)
+    
+    if scores is not None:
+        return sorted_prev_keypoints, sorted_keypoints, sorted_scores
+    else:  # For Pose2Sim.triangulation()
+        return sorted_keypoints, associated_tuples
+

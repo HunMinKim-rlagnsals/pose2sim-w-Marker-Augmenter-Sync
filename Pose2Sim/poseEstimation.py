@@ -40,7 +40,7 @@ from tqdm import tqdm
 import cv2
 
 from rtmlib import PoseTracker, Body, Wholebody, BodyWithFeet, draw_skeleton
-from Pose2Sim.common import natural_sort_key, sort_people_sports2d
+from Pose2Sim.common import natural_sort_key, sort_people_convexhull
 
 
 ## AUTHORSHIP INFORMATION
@@ -208,8 +208,9 @@ def process_video(video_path, pose_tracker, output_format, save_video, save_imag
 
                 # Tracking people IDs across frames
                 if multi_person:
+                    logging.info('Sorting people across frames with convex hull...')
                     if 'prev_keypoints' not in locals(): prev_keypoints = keypoints
-                    prev_keypoints, keypoints, scores = sort_people_sports2d(prev_keypoints, keypoints, scores=scores)
+                    prev_keypoints, keypoints, scores = sort_people_convexhull(prev_keypoints, keypoints, scores=scores)
            
                 # Save to json
                 if 'openpose' in output_format:
@@ -298,7 +299,7 @@ def process_images(image_folder_path, vid_img_extension, pose_tracker, output_fo
             # Tracking people IDs across frames
             if multi_person:
                 if 'prev_keypoints' not in locals(): prev_keypoints = keypoints
-                prev_keypoints, keypoints, scores = sort_people_sports2d(prev_keypoints, keypoints, scores)
+                prev_keypoints, keypoints, scores = sort_people_convexhull(prev_keypoints, keypoints, scores)
             
             # Extract frame number from the filename
             if 'openpose' in output_format:
