@@ -526,34 +526,67 @@ def time_lagged_cross_corr(camx, camy, lag_range, show=True, ref_cam_name='0', c
     if isinstance(lag_range, int):
         lag_range = [-lag_range, lag_range]
 
-    pearson_r = [camx.corr(camy.shift(lag)) for lag in range(lag_range[0], lag_range[1])]
-    offset = int(np.floor(len(pearson_r)/2)-np.argmax(pearson_r))
+    # Initialize lists for correlation values and valid data points
+    pearson_r = []
+    valid_points = []
+
+    # Calculate correlation for each lag
+    for lag in range(lag_range[0], lag_range[1]):
+        # Shift the camy
+        shifted_camy = camy.shift(lag)
+        
+        # Get valid data mask
+        mask_x = ~(np.isnan(camx) | (camx == 0)) # True = not nan or not 0
+        mask_y = ~(np.isnan(shifted_camy) | (shifted_camy == 0))
+        valid_mask = mask_x & mask_y # not nan and not 0
+        
+        # Count valid overlapping points
+        n_valid = valid_mask.sum()
+        valid_points.append(n_valid)
+        
+        # Calculate correlation only if there are enough valid points
+        if n_valid > 10:  # Minimum number of points
+            corr = camx[valid_mask].corr(shifted_camy[valid_mask])
+            pearson_r.append(corr)
+        else:
+            pearson_r.append(np.nan)
+
+    pearson_r = np.array(pearson_r)
+    valid_points = np.array(valid_points)
+
+    # Find the best offset considering both correlation and number of valid points
     if not np.isnan(pearson_r).all():
-        max_corr = np.nanmax(pearson_r)
+        
+        # Weight correlations by number of valid points
+        weighted_corr = pearson_r * (valid_points / valid_points.max())
+        max_idx = np.nanargmax(weighted_corr)
+        offset = int(np.floor(len(pearson_r)/2) - max_idx)
+        max_corr = pearson_r[max_idx]
 
         if show:
             f, ax = plt.subplots(2,1)
             # speed
-            camx.plot(ax=ax[0], label = f'Reference: {ref_cam_name}')
-            camy.plot(ax=ax[0], label = f'Compared: {cam_name}')
+            camx.plot(ax=ax[0], label=f'Reference: {ref_cam_name}')
+            camy.plot(ax=ax[0], label=f'Compared: {cam_name}')
             ax[0].set(xlabel='Frame', ylabel='Speed (px/frame)')
-            ax[0].legend()
+            ax[0].legend(loc='upper right')
+            
             # time lagged cross-correlation
             ax[1].plot(list(range(lag_range[0], lag_range[1])), pearson_r)
-            ax[1].axvline(np.ceil(len(pearson_r)/2) + lag_range[0],color='k',linestyle='--')
-            ax[1].axvline(np.argmax(pearson_r) + lag_range[0],color='r',linestyle='--',label='Peak synchrony')
+            ax[1].plot(list(range(lag_range[0], lag_range[1])), weighted_corr, '--', label='Adjusted pearson r')
+            ax[1].axvline(np.ceil(len(pearson_r)/2) + lag_range[0], color='k', linestyle='--')
+            ax[1].axvline(max_idx + lag_range[0],color='r',linestyle='--',label='Peak synchrony')
             plt.annotate(f'Max correlation={np.round(max_corr,2)}', xy=(0.05, 0.9), xycoords='axes fraction')
             ax[1].set(title=f'Offset = {offset} frames', xlabel='Offset (frames)',ylabel='Pearson r')
+            ax[1].legend(loc='upper right')
             
-            plt.legend()
             f.tight_layout()
             plt.show()
     else:
         max_corr = 0
         offset = 0
         if show:
-            # print('No good values to interpolate')
-            pass
+            logging.warning('No valid correlation values found')
 
     return offset, max_corr
 
