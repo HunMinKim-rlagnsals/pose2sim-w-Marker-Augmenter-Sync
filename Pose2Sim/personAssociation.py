@@ -44,6 +44,10 @@ import cv2
 from anytree import RenderTree
 from anytree.importer import DictImporter
 import logging
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, TextBox
+from matplotlib.animation import FuncAnimation
+from scipy.spatial import ConvexHull
 
 from Pose2Sim.common import retrieve_calib_params, computeP, weighted_triangulation, \
     reprojection, euclidean_distance, sort_stringlist_by_last_number
@@ -548,7 +552,8 @@ def rewrite_json_files(json_tracked_files_f, json_files_f, proposals, n_cams):
                             js_new['people'] += [{}]
                 json_tracked_f.write(json.dumps(js_new))
         except:
-            os.remove(json_tracked_files_f[cam])
+            if os.path.exists(json_tracked_files_f[cam]):
+                os.remove(json_tracked_files_f[cam])
 
 
 def recap_tracking(config_dict, error=0, nb_cams_excluded=0):
@@ -611,6 +616,519 @@ def recap_tracking(config_dict, error=0, nb_cams_excluded=0):
     logging.info(f'\nTracked json files are stored in {os.path.realpath(poseTracked_dir)}.')
     
 
+def update_frame(cap, ax, slider, text_box, fig):
+    '''
+    Update the frame display based on slider value
+    '''
+    frame_num = int(slider.val)
+    if isinstance(cap, cv2.VideoCapture):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, frame = cap.read()
+    else:
+        frame = cv2.imread(cap[frame_num])
+    ax.images[0].set_array(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    text_box.set_val(str(frame_num))
+    fig.canvas.draw_idle()
+
+def on_select(event, selected_frames, slider, ax, plt, btn_select):
+    '''
+    Handle frame selection button click
+    '''
+    selected_frames.append(int(slider.val))
+    if len(selected_frames) == 2:
+        plt.close()
+    elif len(selected_frames) == 1:
+        ax.set_title(f'{ax.get_title().split(":")[0]}: Now select end frame', fontsize=10, color='black', pad=15)
+        btn_select.label.set_text('End Frame')
+
+def on_reset(event, selected_frames, slider, ax, btn_select):
+    '''
+    Handle reset button click
+    '''
+    selected_frames.clear()
+    ax.set_title(f'{ax.get_title().split(":")[0]}: Select start and end frames', fontsize=10, color='black', pad=15)
+    btn_select.label.set_text('Start Frame')
+
+def get_frame_range(vid_or_img_files, cam_names, ref_cam):
+    '''
+    Allows the user to select the frame range by visualizing the video frames from the reference camera.
+    
+    INPUTS:
+    - vid_or_img_files: list of str. Paths to the video files for each camera or to the image directories for each camera.
+    - cam_names: list of str. Names of the cameras.
+    - ref_cam: str. Name of the reference camera.
+    
+    OUTPUT:
+    - frame_range: list of int. [start_frame, end_frame]
+    '''
+    logging.info('Manual frame range selection mode: Select the start and end frames.')
+    
+    try: # video files
+        video_files_dict = {cam_name: file for cam_name, file in zip(cam_names, vid_or_img_files)}
+    except: # image directories 
+        video_files_dict = {cam_name: files for cam_name, files in zip(cam_names, vid_or_img_files)}
+    
+    selected_frames = []
+    
+    # Only use reference camera
+    vid_or_img_files_cam = video_files_dict.get(ref_cam)
+    if not vid_or_img_files_cam:
+        logging.warning(f'No video file nor image directory found for reference camera {ref_cam}')
+        return [0, 0]  # Return default range if reference camera not found
+        
+    try:
+        cap = cv2.VideoCapture(vid_or_img_files_cam)
+        if not cap.isOpened():
+            raise
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    except:
+        cap = vid_or_img_files_cam
+        total_frames = len(cap)
+    
+    # Read first frame
+    if isinstance(cap, cv2.VideoCapture):
+        ret, frame = cap.read()
+        if not ret:
+            logging.warning(f'Cannot read frame from video {vid_or_img_files_cam}')
+            return [0, total_frames]
+    else:
+        try:
+            frame = cv2.imread(cap[0])
+        except:
+            logging.warning(f'Cannot read frame from directory {vid_or_img_files_cam}')
+            return [0, total_frames]
+    
+    frame_height, frame_width = frame.shape[:2]
+    fig_width, fig_height = frame_width / 200, frame_height / 250
+    
+    # Initialize plot
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    ax.set_title(f'{ref_cam}: Select start and end frames', fontsize=10, color='black', pad=15)
+    ax.axis('off')
+    
+    # Add slider
+    ax_slider = plt.axes([ax.get_position().x0, 0.05, ax.get_position().width - 0.112, 0.05])
+    slider = Slider(ax_slider, '', 0, total_frames - 1, valfmt='%d')
+    
+    # Add text box for frame number
+    ax_text = plt.axes([ax.get_position().x0 + ax.get_position().width - 0.087, 0.06, 0.04, 0.03])
+    text_box = TextBox(ax_text, 'Frame', initial='0')
+    
+    # Add buttons
+    ax_prev = plt.axes([ax.get_position().x0 + ax.get_position().width - 0.044, 0.06, 0.02, 0.03])
+    ax_next = plt.axes([ax.get_position().x0 + ax.get_position().width - 0.021, 0.06, 0.02, 0.03])
+    btn_prev = plt.Button(ax_prev, '<')
+    btn_next = plt.Button(ax_next, '>')
+    
+    # Add select button with initial text 'Start Frame'
+    ax_select = plt.axes([ax.get_position().x0 + ax.get_position().width - 0.1, 0.01, 0.1, 0.03])
+    btn_select = plt.Button(ax_select, 'Start Frame')
+    
+    # Add reset button
+    ax_reset = plt.axes([ax.get_position().x0, 0.01, 0.05, 0.03])
+    btn_reset = plt.Button(ax_reset, 'Reset')
+    
+    # Connect callbacks
+    slider.on_changed(lambda val: update_frame(cap, ax, slider, text_box, fig))
+    text_box.on_submit(lambda text: slider.set_val(int(text)) if text.isdigit() else None)
+    btn_prev.on_clicked(lambda event: slider.set_val(max(0, int(slider.val) - 1)))
+    btn_next.on_clicked(lambda event: slider.set_val(min(total_frames - 1, int(slider.val) + 1)))
+    btn_select.on_clicked(lambda event: on_select(event, selected_frames, slider, ax, plt, btn_select))
+    btn_reset.on_clicked(lambda event: on_reset(event, selected_frames, slider, ax, btn_select))
+    
+    plt.show()
+    if isinstance(cap, cv2.VideoCapture):
+        cap.release()
+    
+    if len(selected_frames) != 2:
+        logging.warning('Frame range selection incomplete. Using default range.')
+        return [0, total_frames]
+    
+    return sorted(selected_frames)
+
+def onclick_person_select(event, ax, person_patches, selected_person_idx, fig):
+    if event.inaxes == ax:
+        x_click = event.xdata
+        y_click = event.ydata
+        min_dist = float('inf')
+        selected_idx = None
+        for scat, hull_patch, idx in person_patches:
+            x_data = scat.get_offsets()[:, 0]
+            y_data = scat.get_offsets()[:, 1]
+            distances = np.sqrt((x_data - x_click)**2 + (y_data - y_click)**2)
+            if len(distances) > 0:
+                dist = np.min(distances)
+                if dist < min_dist:
+                    min_dist = dist
+                    selected_idx = idx
+        if selected_idx is not None:
+            selected_person_idx.append(selected_idx)
+            plt.close(fig)
+
+def on_motion_person_select(event, ax, person_patches, fig):
+    if event.inaxes == ax:
+        for scat, hull_patch, idx in person_patches:
+            path = hull_patch.get_path()
+            if path.contains_point([event.xdata, event.ydata]):
+                hull_patch.set_alpha(0.5)
+                scat.set_sizes([50])  # Highlight points
+            else:
+                hull_patch.set_alpha(0.2)
+                scat.set_sizes([25])  # Normal size
+        fig.canvas.draw_idle()
+
+def select_person_manually(people, frame=None):
+    if frame is not None:
+        frame_height, frame_width = frame.shape[:2]
+    else:
+        frame_width, frame_height = 4000, 3000  # default 
+        
+    fig, ax = plt.subplots(figsize=(12, 8))
+    person_patches = []
+    hull_patches = []  # Store hull patches for highlighting
+
+    for i, person in enumerate(people):
+        keypoints = np.array(person['pose_keypoints_2d']).reshape(-1, 3)
+        x_data = keypoints[:, 0]
+        y_data = keypoints[:, 1]
+        valid = (x_data != 0) & (y_data != 0) & (~np.isnan(x_data)) & (~np.isnan(y_data))
+        x_data = x_data[valid]
+        y_data = y_data[valid]
+
+        if len(x_data) < 3:
+            continue
+            
+        # Add ConvexHull first to check if it's possible
+        points = np.column_stack((x_data, -y_data))
+        hull = ConvexHull(points)
+            
+        # If ConvexHull creation successful, add scatter and polygon
+        scat = ax.scatter(x_data, -y_data, label=f'Person {i}', s=25)
+        hull_path = plt.Polygon(points[hull.vertices], alpha=0.2, color=scat.get_facecolor())
+        ax.add_patch(hull_path)
+        hull_patches.append(hull_path)
+            
+        ax.annotate(f'{i}', xy=(np.mean(x_data), -np.mean(y_data)), color='red', fontsize=12)
+        person_patches.append((scat, hull_path, i))
+
+    if not person_patches:
+        logging.error("No valid persons found with enough keypoints for ConvexHull")
+        return 0  # Default to first person if no valid ConvexHull could be created
+
+    ax.set_title('Click on the person you want to track')
+    ax.set_xlim([0, frame_width])
+    ax.set_ylim([-frame_height, 0])
+
+    selected_person_idx = []
+    
+    fig.canvas.mpl_connect('motion_notify_event', 
+                          lambda event: on_motion_person_select(event, ax, person_patches, fig))
+    fig.canvas.mpl_connect('button_press_event', 
+                          lambda event: onclick_person_select(event, ax, person_patches, selected_person_idx, fig))
+    plt.show()
+
+    if not selected_person_idx:
+        logging.warning("No person selected, defaulting to person 0")
+        return 0
+    
+    selected_id = selected_person_idx[0]
+    logging.info(f"Selected person ID: {selected_id}")
+    return selected_id
+
+def track_with_convexhull(json_files_f, selected_id, is_last_frame=False):
+    '''
+    Track person using ConvexHull method with area and center distance consideration
+    '''
+    if not json_files_f or 'none' in json_files_f:
+        logging.debug("No valid json files provided")
+        return None
+    
+    try:
+        # Static variables to store last known information
+        if not hasattr(track_with_convexhull, 'last_hull_center'):
+            track_with_convexhull.last_hull_center = None
+            track_with_convexhull.last_hull_area = None
+            track_with_convexhull.initial_id = selected_id
+            track_with_convexhull.last_keypoints = None  # 이전 프레임의 keypoint 패턴 저장
+
+        frame_num = int(re.findall(r'\d+', json_files_f[0])[-1])
+        logging.info(f"\n=== Processing Frame {frame_num} ===")
+        
+        with open(json_files_f[0], 'r') as f:
+            data = json.load(f)
+            people = data.get('people', [])
+            logging.info(f"Found {len(people)} people in frame")
+            
+            if not people:
+                logging.debug("No people detected in frame")
+                return None
+
+            # First frame or no previous information
+            if track_with_convexhull.last_hull_center is None:
+                if selected_id >= len(people):
+                    logging.debug(f"Selected ID {selected_id} is out of range. Only {len(people)} people detected")
+                    return None
+
+                # Get initial person's information
+                keypoints_to_track = np.array(people[selected_id]['pose_keypoints_2d']).reshape(-1, 3)
+                valid_points_to_track = keypoints_to_track[~np.isnan(keypoints_to_track).any(axis=1) & 
+                                                         (keypoints_to_track != 0).all(axis=1)][:, :2]
+                
+                if len(valid_points_to_track) < 3:
+                    logging.debug(f"Not enough valid keypoints for person {selected_id}")
+                    return None
+
+                try:
+                    hull_to_track = ConvexHull(valid_points_to_track)
+                    track_with_convexhull.last_hull_center = np.mean(valid_points_to_track[hull_to_track.vertices], axis=0)
+                    track_with_convexhull.last_hull_area = hull_to_track.area
+                    track_with_convexhull.last_keypoints = keypoints_to_track  # 초기 keypoint 패턴 저장
+                    return selected_id
+                except Exception as e:
+                    logging.debug(f"Failed to compute initial ConvexHull: {str(e)}")
+                    return None
+
+            # For subsequent frames, find the best match based on previous frame
+            best_score = float('-inf')
+            best_id = None
+            best_metrics = None
+            all_scores = []
+
+            for idx, person in enumerate(people):
+                keypoints = np.array(person['pose_keypoints_2d']).reshape(-1, 3)
+                valid_points = keypoints[~np.isnan(keypoints).any(axis=1) & 
+                                      (keypoints != 0).all(axis=1)][:, :2]
+
+                if len(valid_points) < 3:
+                    continue
+
+                try:
+                    hull = ConvexHull(valid_points)
+                    hull_center = np.mean(valid_points[hull.vertices], axis=0)
+                    hull_area = hull.area
+
+                    # Calculate metrics relative to last known position
+                    center_dist = euclidean_distance(track_with_convexhull.last_hull_center, hull_center)
+                    area_diff = abs(track_with_convexhull.last_hull_area - hull_area) / max(track_with_convexhull.last_hull_area, hull_area)
+                    
+                    # Calculate keypoint pattern similarity
+                    keypoint_similarity = calculate_keypoint_similarity(track_with_convexhull.last_keypoints, keypoints)
+                    
+                    # Adjusted scoring including keypoint similarity:
+                    # - 0.5 weight to center distance (continuous motion)
+                    # - 0.1 weight to area difference (pose changes)
+                    # - 0.4 weight to keypoint similarity (person identification)
+                    score = -(center_dist * 0.5 + area_diff * 100 * 0.1 - keypoint_similarity * 0.4)
+                    all_scores.append((idx, score, center_dist, area_diff, keypoint_similarity))
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_id = idx
+                        best_metrics = {
+                            'center_dist': center_dist,
+                            'area_diff': area_diff * 100,
+                            'hull_center': hull_center,
+                            'hull_area': hull_area,
+                            'keypoints': keypoints,
+                            'keypoint_similarity': keypoint_similarity
+                        }
+
+                except Exception as e:
+                    continue
+
+            if best_id is None:
+                logging.debug("No valid matches found")
+                return None
+
+            # Update last known information for next frame
+            track_with_convexhull.last_hull_center = best_metrics['hull_center']
+            track_with_convexhull.last_hull_area = best_metrics['hull_area']
+            track_with_convexhull.last_keypoints = best_metrics['keypoints']
+
+            # Log tracking information
+            all_scores.sort(key=lambda x: x[1], reverse=True)
+            logging.info("\nScore Rankings:")
+            for idx, score, dist, area_diff, kp_sim in all_scores:
+                logging.info(f"Person {idx}: Score={score:.2f}, Dist={dist:.2f}, AreaDiff={area_diff*100:.2f}%, KP_Sim={kp_sim:.2f}")
+            
+            logging.info(f"\nBest match selected: Person {best_id}")
+            logging.info(f"  - Score: {best_score:.2f}")
+            logging.info(f"  - Center Distance: {best_metrics['center_dist']:.2f} pixels")
+            logging.info(f"  - Area Difference: {best_metrics['area_diff']:.2f}%")
+            logging.info(f"  - Keypoint Similarity: {best_metrics['keypoint_similarity']:.2f}")
+
+            return best_id
+
+    except Exception as e:
+        logging.debug(f"Unexpected error in track_with_convexhull: {str(e)}")
+        return None
+
+def calculate_keypoint_similarity(prev_keypoints, curr_keypoints):
+    """
+    Calculate similarity between two sets of keypoints
+    높을수록 더 유사함을 의미
+    """
+    if prev_keypoints is None or curr_keypoints is None:
+        return 0.0
+        
+    try:
+        # 유효한 keypoint만 선택 (confidence > 0)
+        prev_valid = prev_keypoints[prev_keypoints[:, 2] > 0][:, :2]
+        curr_valid = curr_keypoints[curr_keypoints[:, 2] > 0][:, :2]
+        
+        if len(prev_valid) < 3 or len(curr_valid) < 3:
+            return 0.0
+            
+        # 각 keypoint set의 중심점을 원점으로 이동 (translation 무시)
+        prev_centered = prev_valid - np.mean(prev_valid, axis=0)
+        curr_centered = curr_valid - np.mean(curr_valid, axis=0)
+        
+        # 각 keypoint set을 정규화 (scale 무시)
+        prev_normalized = prev_centered / np.linalg.norm(prev_centered)
+        curr_normalized = curr_centered / np.linalg.norm(curr_centered)
+        
+        # 최소 길이에 맞춰 자르기
+        min_len = min(len(prev_normalized), len(curr_normalized))
+        prev_normalized = prev_normalized[:min_len]
+        curr_normalized = curr_normalized[:min_len]
+        
+        # 패턴 유사도 계산 (높을수록 유사)
+        similarity = 1.0 / (1.0 + np.mean(np.abs(prev_normalized - curr_normalized)))
+        
+        return similarity
+        
+    except Exception as e:
+        logging.debug(f"Error calculating keypoint similarity: {str(e)}")
+        return 0.0
+
+def animate_pre_post_tracking(pre_tracking_data, post_tracking_data, folder_name, frame_step=10, interval=100):
+    fig, (pre_ax, post_ax) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Add buttons
+    replay_ax = plt.axes([0.8, 0.02, 0.1, 0.04])
+    next_ax = plt.axes([0.91, 0.02, 0.08, 0.04])
+    replay_button = plt.Button(replay_ax, 'Replay')
+    next_button = plt.Button(next_ax, 'Next')
+    
+    # Animation control variables
+    animation_running = {'value': True}
+    
+    # Define post-tracking color
+    post_color = 'red'
+    
+    def update(frame):
+        pre_ax.clear()
+        post_ax.clear()
+        pre_ax.set_title(f'Pre-Tracking: {folder_name}')
+        pre_ax.set_xlim([0, 4000])
+        pre_ax.set_ylim([-3000, 0])
+        post_ax.set_title(f'Post-Tracking: {folder_name}')
+        post_ax.set_xlim([0, 4000])
+        post_ax.set_ylim([-3000, 0])
+
+        # Pre-tracking data
+        if frame < len(pre_tracking_data):
+            people = pre_tracking_data[frame]
+            for person_idx, person in enumerate(people):
+                try:
+                    # Convert to numpy arrays and ensure float type
+                    x_data = np.array(person['pose_keypoints_2d'][0::3], dtype=float)
+                    y_data = np.array(person['pose_keypoints_2d'][1::3], dtype=float)
+                    
+                    # Create mask for valid points
+                    valid_x = ~np.isnan(x_data) & ~np.isinf(x_data) & (x_data != 0)
+                    valid_y = ~np.isnan(y_data) & ~np.isinf(y_data) & (y_data != 0)
+                    valid_mask = valid_x & valid_y
+                    
+                    x_valid = x_data[valid_mask]
+                    y_valid = y_data[valid_mask]
+                    
+                    if len(x_valid) >= 3:  # Need at least 3 points for ConvexHull
+                        valid_points = np.column_stack((x_valid, y_valid))
+                        try:
+                            hull = ConvexHull(valid_points)
+                            # Create scatter plot to get consistent color
+                            scat = pre_ax.scatter(x_valid, -y_valid, s=25)
+                            color = scat.get_facecolor()[0]
+                            # Remove scatter and replot with consistent style
+                            scat.remove()
+                            # Plot points
+                            pre_ax.plot(x_valid, -y_valid, 'o', color=color)
+                            # Plot hull edges
+                            for simplex in hull.simplices:
+                                pre_ax.plot(valid_points[simplex, 0], -valid_points[simplex, 1], '-', color=color)
+                            # Fill hull with transparent color
+                            hull_points = valid_points[hull.vertices]
+                            pre_ax.fill(hull_points[:, 0], -hull_points[:, 1], color=color, alpha=0.2)
+                            # Add person number
+                            pre_ax.annotate(f'{person_idx}', xy=(np.mean(x_valid), -np.mean(y_valid)), 
+                                          color='red', fontsize=12)
+                        except:
+                            # If ConvexHull fails, just plot the points
+                            scat = pre_ax.scatter(x_valid, -y_valid, s=25)
+                            color = scat.get_facecolor()[0]
+                            scat.remove()
+                            pre_ax.plot(x_valid, -y_valid, 'o', color=color)
+                except Exception as e:
+                    pass  # Skip this person if there's an error
+
+        # Post-tracking data
+        if frame < post_tracking_data.shape[0]:
+            try:
+                # Convert to numpy arrays and ensure float type
+                x_data = np.array(post_tracking_data[frame, 0::3], dtype=float)
+                y_data = np.array(post_tracking_data[frame, 1::3], dtype=float)
+                
+                # Create mask for valid points
+                valid_x = ~np.isnan(x_data) & ~np.isinf(x_data) & (x_data != 0)
+                valid_y = ~np.isnan(y_data) & ~np.isinf(y_data) & (y_data != 0)
+                valid_mask = valid_x & valid_y
+                
+                x_valid = x_data[valid_mask]
+                y_valid = y_data[valid_mask]
+                
+                if len(x_valid) >= 3:  # Need at least 3 points for ConvexHull
+                    valid_points = np.column_stack((x_valid, y_valid))
+                    try:
+                        hull = ConvexHull(valid_points)
+                        # Plot points with orange color
+                        post_ax.plot(x_valid, -y_valid, 'o', color=post_color)
+                        # Plot hull edges
+                        for simplex in hull.simplices:
+                            post_ax.plot(valid_points[simplex, 0], -valid_points[simplex, 1], '-', color=post_color)
+                        # Fill hull with transparent color
+                        hull_points = valid_points[hull.vertices]
+                        post_ax.fill(hull_points[:, 0], -hull_points[:, 1], color=post_color, alpha=0.2)
+                    except:
+                        # If ConvexHull fails, just plot the points
+                        post_ax.plot(x_valid, -y_valid, 'o', color=post_color)
+            except Exception as e:
+                pass  # Skip this frame if there's an error
+
+        return pre_ax.get_children() + post_ax.get_children()  # Return artists for animation
+
+    def replay(event):
+        ani.frame_seq = ani.new_frame_seq()
+        ani.event_source.start()
+    
+    def next_camera(event):
+        animation_running['value'] = False
+        plt.close(fig)
+    
+    replay_button.on_clicked(replay)
+    next_button.on_clicked(next_camera)
+
+    max_frames = max(len(pre_tracking_data), post_tracking_data.shape[0])
+    frames = list(range(0, max_frames, frame_step))
+    
+    ani = FuncAnimation(fig, update, frames=frames, interval=interval, repeat=True)
+    
+    plt.tight_layout()
+    plt.show(block=True)  # Changed to block=True to wait for user input
+    
+    return animation_running['value']
+
 def associate_all(config_dict):
     '''
     For each frame,
@@ -645,6 +1163,8 @@ def associate_all(config_dict):
     min_affinity = config_dict.get('personAssociation').get('multi_person').get('min_affinity')
     frame_range = config_dict.get('project').get('frame_range')
     undistort_points = config_dict.get('triangulation').get('undistort_points')
+    vid_img_extension = config_dict['pose']['vid_img_extension']
+    use_ConvexHull = config_dict.get('personAssociation').get('use_ConvexHull')
     
     try:
         calib_dir = [os.path.join(session_dir, c) for c in os.listdir(session_dir) if os.path.isdir(os.path.join(session_dir, c)) and  'calib' in c.lower()][0]
@@ -689,22 +1209,54 @@ def associate_all(config_dict):
     except:
         raise ValueError(f'No json files found in {pose_dir} subdirectories. Make sure you run Pose2Sim.poseEstimation() first.')
     json_dirs_names = [k for k in pose_listdirs_names if 'json' in k]
+
+    # Try to load from poseSync_dir first, fallback to pose_dir if not found
     try: 
         json_files_names = [fnmatch.filter(os.listdir(os.path.join(poseSync_dir, js_dir)), '*.json') for js_dir in json_dirs_names]
+        json_base_dir = poseSync_dir
     except:
-        try:
-            json_files_names = [fnmatch.filter(os.listdir(os.path.join(pose_dir, js_dir)), '*.json') for js_dir in json_dirs_names]
-        except:
+        json_files_names = [fnmatch.filter(os.listdir(os.path.join(pose_dir, js_dir)), '*.json') for js_dir in json_dirs_names]
+        json_base_dir = pose_dir
+        if not any(json_files_names):
             raise ValueError(f'No json files found in {pose_dir} nor {poseSync_dir} subdirectories. Make sure you run Pose2Sim.poseEstimation() first.')
-    json_files_names = [sort_stringlist_by_last_number(j) for j in json_files_names]
     
+    json_files_names = [sort_stringlist_by_last_number(j) for j in json_files_names]
+
+    # reference camera
+    min_frame_range = min([len(j) for j in json_files_names])
+    ref_cam = json_dirs_names[0]
+
     # 2d-pose-associated files creation
     if not os.path.exists(poseTracked_dir): os.mkdir(poseTracked_dir)   
     try: [os.mkdir(os.path.join(poseTracked_dir,k)) for k in json_dirs_names]
     except: pass
     
     error_min_tot, cameras_off_tot = [], []
+    
+    # Handle manual frame range selection
+    if frame_range == 'manual':
+        # Get video files or image directories
+        video_dir = os.path.join(project_dir, 'videos')
+        vid_or_img_files = glob.glob(os.path.join(video_dir, '*'+vid_img_extension))
+        if not vid_or_img_files:  # If no video files found, try using image directories
+            try:
+                image_folders = [f for f in os.listdir(video_dir) if os.path.isdir(os.path.join(video_dir, f))]
+                vid_or_img_files = []
+                for image_folder in image_folders:
+                    img_files = glob.glob(os.path.join(video_dir, image_folder, '*'+vid_img_extension))
+                    if img_files:  # Only add if directory contains matching files
+                        vid_or_img_files.append(sorted(img_files))
+            except:
+                raise ValueError(f'No video files or image directories found in {video_dir} for manual frame selection.')
+            
+            if not vid_or_img_files:
+                raise ValueError(f'No {vid_img_extension} files found in the image directories.')
+            
+        # get frame range
+        frame_range = get_frame_range(vid_or_img_files, json_dirs_names, ref_cam)
+    
     f_range = [[0,max([len(j) for j in json_files_names])] if frame_range==[] else frame_range][0]
+    print(f"f_range: {f_range}")
     n_cams = len(json_dirs_names)
 
     # Check that camera number is consistent between calibration file and pose folders
@@ -717,39 +1269,66 @@ def associate_all(config_dict):
         # print(f'\nFrame {f}:')
         json_files_names_f = [[j for j in json_files_names[c] if int(re.split(r'(\d+)',j)[-2])==f] for c in range(n_cams)]
         json_files_names_f = [j for j_list in json_files_names_f for j in (j_list or ['none'])]
-        try:
-            json_files_f = [os.path.join(poseSync_dir, json_dirs_names[c], json_files_names_f[c]) for c in range(n_cams)]
-            with open(os.path.exist(json_files_f[0])) as json_exist_test: pass
-        except:
-            json_files_f = [os.path.join(pose_dir, json_dirs_names[c], json_files_names_f[c]) for c in range(n_cams)]
+        json_files_f = [os.path.join(json_base_dir, json_dirs_names[c], json_files_names_f[c]) for c in range(n_cams)]
         json_tracked_files_f = [os.path.join(poseTracked_dir, json_dirs_names[c], json_files_names_f[c]) for c in range(n_cams)]
 
         if not multi_person:
-            # all possible combinations of persons
-            personsIDs_comb = persons_combinations(json_files_f) 
+            if use_ConvexHull and f == f_range[0]:  # First frame for ConvexHull
+                # Get initial person selection for each camera
+                selected_ids = []
+                for cam in range(n_cams):
+                    try:
+                        with open(json_files_f[cam], 'r') as f_cam:
+                            data = json.load(f_cam)
+                            logging.info(f'\nSelecting person for camera {cam+1}')
+                            # Get the first frame
+                            if isinstance(vid_or_img_files[cam], str):  # video file
+                                cap = cv2.VideoCapture(vid_or_img_files[cam])
+                                ret, frame = cap.read()
+                                cap.release()
+                            else:  # image directory
+                                frame = cv2.imread(vid_or_img_files[cam][0])
+                            selected_id = select_person_manually(data.get('people', []), frame)
+                            if selected_id is None:
+                                raise ValueError(f"No person selected for tracking in camera {cam+1}")
+                            selected_ids.append(selected_id)
+                    except:
+                        selected_ids.append(0)
+                        logging.warning(f"Failed to manually select person for camera {cam+1}, defaulting to person 0")
             
-            # choose persons of interest and exclude cameras with bad pose estimation
-            error_proposals, proposals, Q_kpt = best_persons_and_cameras_combination(config_dict, json_files_f, personsIDs_comb, P_all, tracked_keypoint_id, calib_params)
+            if use_ConvexHull:
+                # Track person using ConvexHull method for each camera independently
+                proposals = []
+                for cam in range(n_cams):
+                    if f == f_range[0]:  # Use initially selected person
+                        tracked_id = selected_ids[cam]
+                    else:  # Track from previous frame
+                        tracked_id = track_with_convexhull([json_files_f[cam]], selected_ids[cam], is_last_frame=(f == f_range[-1]))
+                        if tracked_id is not None:  # Update selected_id for next frame if tracking successful
+                            selected_ids[cam] = tracked_id
+                    proposals.append([tracked_id if tracked_id is not None else np.nan])
+                proposals = np.array(proposals).T
+            else:
+                # Original single-person tracking logic
+                personsIDs_comb = persons_combinations(json_files_f) 
+                error_proposals, proposals, Q_kpt = best_persons_and_cameras_combination(config_dict, json_files_f, personsIDs_comb, P_all, tracked_keypoint_id, calib_params)
 
-            if not np.isinf(error_proposals):
-                error_min_tot.append(np.nanmean(error_proposals))
-            cameras_off_count = np.count_nonzero([np.isnan(comb) for comb in proposals]) / len(proposals)
-            cameras_off_tot.append(cameras_off_count)            
+                if not np.isinf(error_proposals):
+                    error_min_tot.append(np.nanmean(error_proposals))
+                cameras_off_count = np.count_nonzero([np.isnan(comb) for comb in proposals]) / len(proposals)
+                cameras_off_tot.append(cameras_off_count)            
 
         else:
-            # read data
+            # Original multi-person tracking logic
             all_json_data_f = []
             for js_file in json_files_f:
                 all_json_data_f.append(read_json(js_file))
-            #TODO: remove people with average likelihood < 0.3, no full torso, less than 12 joints... (cf filter2d in dataset/base.py L498)
             
-            # obtain proposals after computing affinity between all the people in the different views
             persons_per_view = [0] + [len(j) for j in all_json_data_f]
             cum_persons_per_view = np.cumsum(persons_per_view)
             affinity = compute_affinity(all_json_data_f, calib_params, cum_persons_per_view, reconstruction_error_threshold=reconstruction_error_threshold)
             circ_constraint = circular_constraint(cum_persons_per_view)
             affinity = affinity * circ_constraint
-            #TODO: affinity without hand, face, feet (cf ray.py L31)
             affinity = matchSVT(affinity, cum_persons_per_view, circ_constraint, max_iter = 20, w_rank = 50, tol = 1e-4, w_sparse=0.1)
             affinity[affinity<min_affinity] = 0
             proposals = person_index_per_cam(affinity, cum_persons_per_view, min_cameras_for_triangulation)
@@ -757,6 +1336,41 @@ def associate_all(config_dict):
         # rewrite json files with a single or multiple persons of interest
         rewrite_json_files(json_tracked_files_f, json_files_f, proposals, n_cams)
 
+    # Visualize tracking results for each camera
+    for cam in range(n_cams):
+        # Load pre-tracking data
+        pre_tracking_data = []
+        for f in range(*f_range):
+            try:
+                with open(os.path.join(json_base_dir, json_dirs_names[cam], json_files_names[cam][f]), 'r') as f_pre:
+                    pre_tracking_data.append(json.load(f_pre)['people'])
+            except:
+                pre_tracking_data.append([])
+
+        # Load post-tracking data
+        post_tracking_data = []
+        keypoints_array = []
+        for f in range(*f_range):
+            try:
+                with open(os.path.join(poseTracked_dir, json_dirs_names[cam], json_files_names[cam][f]), 'r') as f_post:
+                    data = json.load(f_post)['people']
+                    if data:  # If there are tracked people
+                        keypoints = np.array(data[0]['pose_keypoints_2d'])  # Take the first (tracked) person
+                        keypoints_array.append(keypoints)
+                    else:
+                        keypoints_array.append(np.zeros(len(keypoints)))  # Use zeros if no person detected
+            except:
+                if keypoints_array:  # If we have seen at least one valid frame
+                    keypoints_array.append(np.zeros_like(keypoints_array[0]))
+                else:
+                    continue
+
+        # Convert to numpy array for post-tracking visualization
+        post_tracking_array = np.array(keypoints_array)
+
+        # Animate the comparison
+        logging.info(f"\nVisualizing tracking results for camera {json_dirs_names[cam]}")
+        animate_pre_post_tracking(pre_tracking_data, post_tracking_array, json_dirs_names[cam])
 
     # recap message
     recap_tracking(config_dict, error_min_tot, cameras_off_tot)

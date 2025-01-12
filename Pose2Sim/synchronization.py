@@ -574,8 +574,8 @@ def time_lagged_cross_corr(camx, camy, lag_range, show=True, ref_cam_name='0', c
     pearson_r = [camx.corr(camy.shift(lag)) for lag in range(lag_range[0], lag_range[1])]
     print(f"np.floor(len(pearson_r)/2): {np.floor(len(pearson_r)/2)}")
     print(f"np.argmax(pearson_r): {np.argmax(pearson_r)}")
-    # offset = int(np.argmax(pearson_r)-np.floor(len(pearson_r)/2)) # After update
-    offset = int(np.floor(len(pearson_r)/2)-np.argmax(pearson_r)) # Before update
+    offset = int(np.argmax(pearson_r)-np.floor(len(pearson_r)/2)) # After update
+    #offset = int(np.floor(len(pearson_r)/2)-np.argmax(pearson_r)) # Before update
 
     if not np.isnan(pearson_r).all():
         max_corr = np.nanmax(pearson_r)
@@ -705,6 +705,7 @@ def synchronize_cams_all(config_dict):
     cam_names = [next((part for part in os.path.basename(j_dir).split('_') if 'cam' in part.lower()), os.path.basename(j_dir)) for j_dir in json_dirs]
     # frame range selection
     f_range = [[0, min([len(j) for j in json_files_names])] if frame_range==[] else frame_range][0]
+    print(f"f_range: {f_range}")
     # json_files_names = [[j for j in json_files_cam if int(re.split(r'(\d+)',j)[-2]) in range(*f_range)] for json_files_cam in json_files_names]
 
     # Determine frames to consider for synchronization
@@ -801,7 +802,26 @@ def synchronize_cams_all(config_dict):
 
     # Compute offset for best synchronization:
     # Highest correlation of sum of absolute speeds for each cam compared to reference cam
-    ref_cam_id = nb_frames_per_cam.index(min(nb_frames_per_cam)) # ref cam: least amount of frames
+    # Find camera with earliest max sumspeed peak using Gaussian weights around manually selected frames
+    if is_manual and start_frames:
+        max_speed_frames = []
+        sigma = lag_range / 2  # Standard deviation for Gaussian weight
+        for i in range(len(sum_speeds)):
+            # Create Gaussian weights centered at the selected frame
+            frame_indices = np.arange(len(sum_speeds[i]))
+            selected_frame_idx = start_frames[i] - search_around_frames[i][0]
+            weights = np.exp(-((frame_indices - selected_frame_idx) ** 2) / (2 * sigma ** 2))
+            
+            # Apply weights to the speed values
+            weighted_speeds = sum_speeds[i] * weights
+            
+            # Find max of weighted speeds and convert to global frame number
+            max_speed_idx = weighted_speeds.argmax()
+            max_speed_frames.append(max_speed_idx + search_around_frames[i][0])
+    else:
+        max_speed_frames = [sum_speeds[i].argmax() + search_around_frames[i][0] for i in range(len(sum_speeds))]
+    
+    ref_cam_id = np.argmin(max_speed_frames)  # ref cam: earliest max speed
     ref_cam_name = cam_names[ref_cam_id]
     ref_frame_nb = len(df_coords[ref_cam_id])
     lag_range = int(ref_frame_nb/2)
