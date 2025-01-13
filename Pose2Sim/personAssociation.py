@@ -779,10 +779,9 @@ def on_motion_person_select(event, ax, person_patches, fig):
         fig.canvas.draw_idle()
 
 def select_person_manually(people, frame=None):
+
     if frame is not None:
         frame_height, frame_width = frame.shape[:2]
-    else:
-        frame_width, frame_height = 4000, 3000  # default 
         
     fig, ax = plt.subplots(figsize=(12, 8))
     person_patches = []
@@ -836,67 +835,75 @@ def select_person_manually(people, frame=None):
     logging.info(f"Selected person ID: {selected_id}")
     return selected_id
 
-def track_with_convexhull(json_files_f, selected_id, is_last_frame=False):
+def track_with_convexhull(json_files_f, selected_id, image_size=None):
     '''
     Track person using ConvexHull method with area and center distance consideration
+    Uses specific keypoints (Hip, Knee, Neck, Shoulder, Elbow) for tracking
     '''
     if not json_files_f or 'none' in json_files_f:
         logging.debug("No valid json files provided")
         return None
     
+    # Set max_center_dist as half of the maximum image dimension
+    max_image_size = max(image_size)
+    max_center_dist = max_image_size / 2
+
     try:
         # Static variables to store last known information
         if not hasattr(track_with_convexhull, 'last_hull_center'):
             track_with_convexhull.last_hull_center = None
             track_with_convexhull.last_hull_area = None
             track_with_convexhull.initial_id = selected_id
-            track_with_convexhull.last_keypoints = None  # 이전 프레임의 keypoint 패턴 저장
+            track_with_convexhull.last_keypoints = None  # Store previous frame's keypoint pattern
 
-        frame_num = int(re.findall(r'\d+', json_files_f[0])[-1])
-        logging.info(f"\n=== Processing Frame {frame_num} ===")
+        # Selected keypoint indices for tracking
+        selected_indices = [19,  # Hip
+                          12, 11,  # RHip, LHip
+                          14, 13,  # RKnee, LKnee
+                          18, 17,  # Neck, Head
+                          6, 5,  # RShoulder, LShoulder
+                          8, 7]  # RElbow, LElbow
         
         with open(json_files_f[0], 'r') as f:
             data = json.load(f)
             people = data.get('people', [])
-            logging.info(f"Found {len(people)} people in frame")
             
             if not people:
-                logging.debug("No people detected in frame")
                 return None
 
             # First frame or no previous information
             if track_with_convexhull.last_hull_center is None:
                 if selected_id >= len(people):
-                    logging.debug(f"Selected ID {selected_id} is out of range. Only {len(people)} people detected")
                     return None
 
                 # Get initial person's information
                 keypoints_to_track = np.array(people[selected_id]['pose_keypoints_2d']).reshape(-1, 3)
+                # Filter only selected keypoints
+                keypoints_to_track = keypoints_to_track[selected_indices]
                 valid_points_to_track = keypoints_to_track[~np.isnan(keypoints_to_track).any(axis=1) & 
                                                          (keypoints_to_track != 0).all(axis=1)][:, :2]
                 
                 if len(valid_points_to_track) < 3:
-                    logging.debug(f"Not enough valid keypoints for person {selected_id}")
                     return None
 
                 try:
                     hull_to_track = ConvexHull(valid_points_to_track)
                     track_with_convexhull.last_hull_center = np.mean(valid_points_to_track[hull_to_track.vertices], axis=0)
                     track_with_convexhull.last_hull_area = hull_to_track.area
-                    track_with_convexhull.last_keypoints = keypoints_to_track  # 초기 keypoint 패턴 저장
+                    track_with_convexhull.last_keypoints = keypoints_to_track
                     return selected_id
                 except Exception as e:
-                    logging.debug(f"Failed to compute initial ConvexHull: {str(e)}")
                     return None
 
             # For subsequent frames, find the best match based on previous frame
             best_score = float('-inf')
             best_id = None
             best_metrics = None
-            all_scores = []
 
             for idx, person in enumerate(people):
                 keypoints = np.array(person['pose_keypoints_2d']).reshape(-1, 3)
+                # Filter only selected keypoints
+                keypoints = keypoints[selected_indices]
                 valid_points = keypoints[~np.isnan(keypoints).any(axis=1) & 
                                       (keypoints != 0).all(axis=1)][:, :2]
 
@@ -912,15 +919,20 @@ def track_with_convexhull(json_files_f, selected_id, is_last_frame=False):
                     center_dist = euclidean_distance(track_with_convexhull.last_hull_center, hull_center)
                     area_diff = abs(track_with_convexhull.last_hull_area - hull_area) / max(track_with_convexhull.last_hull_area, hull_area)
                     
-                    # Calculate keypoint pattern similarity
-                    keypoint_similarity = calculate_keypoint_similarity(track_with_convexhull.last_keypoints, keypoints)
+                    # Combine metrics into a single score
+                    # Weight the different components
+                    center_weight = 0.6
+                    area_weight = 0.4
+
+                    # Convert center_dist to a similarity score (closer to 1 is better)
+                    center_score = max(0, 1 - (center_dist / max_center_dist))
                     
-                    # Adjusted scoring including keypoint similarity:
-                    # - 0.5 weight to center distance (continuous motion)
-                    # - 0.1 weight to area difference (pose changes)
-                    # - 0.4 weight to keypoint similarity (person identification)
-                    score = -(center_dist * 0.5 + area_diff * 100 * 0.1 - keypoint_similarity * 0.4)
-                    all_scores.append((idx, score, center_dist, area_diff, keypoint_similarity))
+                    # Convert area_diff to a similarity score (closer to 1 is better)
+                    area_score = 1 - area_diff
+                    
+                    # Combine scores
+                    score = (center_weight * center_score + 
+                            area_weight * area_score )
                     
                     if score > best_score:
                         best_score = score
@@ -931,14 +943,15 @@ def track_with_convexhull(json_files_f, selected_id, is_last_frame=False):
                             'hull_center': hull_center,
                             'hull_area': hull_area,
                             'keypoints': keypoints,
-                            'keypoint_similarity': keypoint_similarity
+                            'center_score': center_score,
+                            'area_score': area_score,
+                            'total_score': score
                         }
 
                 except Exception as e:
                     continue
 
             if best_id is None:
-                logging.debug("No valid matches found")
                 return None
 
             # Update last known information for next frame
@@ -946,61 +959,101 @@ def track_with_convexhull(json_files_f, selected_id, is_last_frame=False):
             track_with_convexhull.last_hull_area = best_metrics['hull_area']
             track_with_convexhull.last_keypoints = best_metrics['keypoints']
 
-            # Log tracking information
-            all_scores.sort(key=lambda x: x[1], reverse=True)
-            logging.info("\nScore Rankings:")
-            for idx, score, dist, area_diff, kp_sim in all_scores:
-                logging.info(f"Person {idx}: Score={score:.2f}, Dist={dist:.2f}, AreaDiff={area_diff*100:.2f}%, KP_Sim={kp_sim:.2f}")
-            
-            logging.info(f"\nBest match selected: Person {best_id}")
-            logging.info(f"  - Score: {best_score:.2f}")
-            logging.info(f"  - Center Distance: {best_metrics['center_dist']:.2f} pixels")
-            logging.info(f"  - Area Difference: {best_metrics['area_diff']:.2f}%")
-            logging.info(f"  - Keypoint Similarity: {best_metrics['keypoint_similarity']:.2f}")
-
             return best_id
 
     except Exception as e:
-        logging.debug(f"Unexpected error in track_with_convexhull: {str(e)}")
         return None
 
-def calculate_keypoint_similarity(prev_keypoints, curr_keypoints):
-    """
-    Calculate similarity between two sets of keypoints
-    높을수록 더 유사함을 의미
-    """
-    if prev_keypoints is None or curr_keypoints is None:
-        return 0.0
+# def calculate_keypoint_similarity(prev_keypoints, curr_keypoints, confidence_threshold=0.5, consider_scale=False):
+#     """
+#     Calculate similarity between two sets of keypoints using Procrustes Analysis
+#     크기를 고려할지 여부를 선택할 수 있음
+    
+#     Args:
+#         prev_keypoints: Previous frame keypoints (N x 3 array: x, y, confidence)
+#         curr_keypoints: Current frame keypoints (N x 3 array: x, y, confidence)
+#         confidence_threshold: Minimum confidence value to consider a keypoint valid
+#         consider_scale: Whether to consider scale differences in similarity calculation
         
-    try:
-        # 유효한 keypoint만 선택 (confidence > 0)
-        prev_valid = prev_keypoints[prev_keypoints[:, 2] > 0][:, :2]
-        curr_valid = curr_keypoints[curr_keypoints[:, 2] > 0][:, :2]
+#     Returns:
+#         float: Similarity score between 0 and 1, where 1 means identical
+#     """
+#     if prev_keypoints is None or curr_keypoints is None:
+#         return 0.0
         
-        if len(prev_valid) < 3 or len(curr_valid) < 3:
-            return 0.0
+#     try:
+#         # 사용할 키포인트 인덱스 (Hip, Knee, Neck, Shoulder)
+#         selected_indices = [19,  # Hip
+#                           12, 11,  # RHip, LHip
+#                           14, 13,  # RKnee, LKnee
+#                           18, 17,  # Neck, Head
+#                           6, 5,  # RShoulder, LShoulder
+#                           8, 7] # RElbow, LElbow
+        
+#         # 선택된 키포인트만 추출
+#         prev_selected = prev_keypoints[selected_indices]
+#         curr_selected = curr_keypoints[selected_indices]
+        
+#         # 양쪽 프레임에서 신뢰도가 높은 키포인트만 선택
+#         prev_valid_mask = prev_selected[:, 2] > confidence_threshold
+#         curr_valid_mask = curr_selected[:, 2] > confidence_threshold
+
+#         # 공통으로 유효한 키포인트만 선택
+#         common_valid_mask = prev_valid_mask & curr_valid_mask
+        
+#         # 유효한 키포인트가 3개 미만이면 유사도 0 반환
+#         if np.sum(common_valid_mask) < 3:
+#             return 0.0
             
-        # 각 keypoint set의 중심점을 원점으로 이동 (translation 무시)
-        prev_centered = prev_valid - np.mean(prev_valid, axis=0)
-        curr_centered = curr_valid - np.mean(curr_valid, axis=0)
+#         # 유효한 키포인트의 좌표만 추출
+#         prev_valid = prev_selected[common_valid_mask][:, :2]
+#         curr_valid = curr_selected[common_valid_mask][:, :2]
         
-        # 각 keypoint set을 정규화 (scale 무시)
-        prev_normalized = prev_centered / np.linalg.norm(prev_centered)
-        curr_normalized = curr_centered / np.linalg.norm(curr_centered)
+#         # 각 키포인트 세트의 중심을 원점으로 이동
+#         prev_centered = prev_valid - np.mean(prev_valid, axis=0)
+#         curr_centered = curr_valid - np.mean(curr_valid, axis=0)
         
-        # 최소 길이에 맞춰 자르기
-        min_len = min(len(prev_normalized), len(curr_normalized))
-        prev_normalized = prev_normalized[:min_len]
-        curr_normalized = curr_normalized[:min_len]
+#         if consider_scale:
+#             # 크기를 고려하는 경우: 정규화 생략
+#             prev_normalized = prev_centered
+#             curr_normalized = curr_centered
+            
+#             # 크기 차이 계산
+#             prev_scale = np.linalg.norm(prev_centered, 'fro')
+#             curr_scale = np.linalg.norm(curr_centered, 'fro')
+#             scale_diff = abs(prev_scale - curr_scale) / max(prev_scale, curr_scale)
+            
+#         else:
+#             # 크기를 고려하지 않는 경우: 이전처럼 정규화 수행
+#             prev_norm = np.linalg.norm(prev_centered, 'fro')
+#             curr_norm = np.linalg.norm(curr_centered, 'fro')
+            
+#             if prev_norm == 0 or curr_norm == 0:
+#                 return 0.0
+                
+#             prev_normalized = prev_centered / prev_norm
+#             curr_normalized = curr_centered / curr_norm
         
-        # 패턴 유사도 계산 (높을수록 유사)
-        similarity = 1.0 / (1.0 + np.mean(np.abs(prev_normalized - curr_normalized)))
+#         # Procrustes Analysis: optimal rotation 계산
+#         H = prev_normalized.T @ curr_normalized
+#         U, _, Vt = np.linalg.svd(H)
+#         R = Vt.T @ U.T
         
-        return similarity
+#         # Procrustes distance 계산 및 similarity score로 변환
+#         aligned_curr = curr_normalized @ R
+#         procrustes_distance = np.linalg.norm(prev_normalized - aligned_curr, 'fro')
         
-    except Exception as e:
-        logging.debug(f"Error calculating keypoint similarity: {str(e)}")
-        return 0.0
+#         if consider_scale:
+#             # 크기 차이를 유사도에 반영
+#             similarity = (1.0 / (1.0 + procrustes_distance)) * (1.0 - scale_diff)
+#         else:
+#             similarity = 1.0 / (1.0 + procrustes_distance)
+        
+#         return similarity
+        
+#     except Exception as e:
+#         logging.debug(f"Error calculating keypoint similarity: {str(e)}")
+#         return 0.0
 
 def animate_pre_post_tracking(pre_tracking_data, post_tracking_data, folder_name, frame_step=10, interval=100):
     fig, (pre_ax, post_ax) = plt.subplots(1, 2, figsize=(15, 5))
@@ -1222,9 +1275,10 @@ def associate_all(config_dict):
     
     json_files_names = [sort_stringlist_by_last_number(j) for j in json_files_names]
 
-    # reference camera
+    # reference camera - use camera with minimum number of frames as reference
     min_frame_range = min([len(j) for j in json_files_names])
-    ref_cam = json_dirs_names[0]
+    ref_cam = [i for i, j in enumerate(json_files_names) if len(j) == min_frame_range][0]
+    ref_cam_name = json_dirs_names[ref_cam]  # Get reference camera folder name
 
     # 2d-pose-associated files creation
     if not os.path.exists(poseTracked_dir): os.mkdir(poseTracked_dir)   
@@ -1233,30 +1287,53 @@ def associate_all(config_dict):
     
     error_min_tot, cameras_off_tot = [], []
     
+    video_dir = os.path.join(project_dir, 'videos')
+    vid_or_img_files = glob.glob(os.path.join(video_dir, '*'+vid_img_extension))
+    image_size = None
+    
+    if not vid_or_img_files:  # If no video files found, try using image directories
+        try:
+            image_folders = [f for f in os.listdir(video_dir) if os.path.isdir(os.path.join(video_dir, f))]
+            vid_or_img_files = []
+            for image_folder in image_folders:
+                img_files = glob.glob(os.path.join(video_dir, image_folder, '*'+vid_img_extension))
+                if img_files:  # Only add if directory contains matching files
+                    vid_or_img_files.append(sorted(img_files))
+                    # Get image size from first image that can be read
+                    if image_size is None:
+                        for img_file in img_files:
+                            img = cv2.imread(img_file)
+                            if img is not None:
+                                image_size = img.shape[:2]  # (height, width)
+                                break
+        except Exception as e:
+            logging.warning(f'Error reading image directories: {str(e)}')
+            
+        if not vid_or_img_files:
+            logging.warning(f'No {vid_img_extension} files found in the image directories.')
+    else:
+        # Get image size from first video that can be read
+        for video_file in vid_or_img_files:
+            cap = cv2.VideoCapture(video_file)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    image_size = frame.shape[:2]  # (height, width)
+                    cap.release()
+                    break
+                cap.release()
+        
+        if image_size is None:
+            logging.warning('Could not read any video files to determine image size.')
+
+    logging.info(f'Using image size: {image_size}')
+
     # Handle manual frame range selection
     if frame_range == 'manual':
-        # Get video files or image directories
-        video_dir = os.path.join(project_dir, 'videos')
-        vid_or_img_files = glob.glob(os.path.join(video_dir, '*'+vid_img_extension))
-        if not vid_or_img_files:  # If no video files found, try using image directories
-            try:
-                image_folders = [f for f in os.listdir(video_dir) if os.path.isdir(os.path.join(video_dir, f))]
-                vid_or_img_files = []
-                for image_folder in image_folders:
-                    img_files = glob.glob(os.path.join(video_dir, image_folder, '*'+vid_img_extension))
-                    if img_files:  # Only add if directory contains matching files
-                        vid_or_img_files.append(sorted(img_files))
-            except:
-                raise ValueError(f'No video files or image directories found in {video_dir} for manual frame selection.')
-            
-            if not vid_or_img_files:
-                raise ValueError(f'No {vid_img_extension} files found in the image directories.')
-            
-        # get frame range
-        frame_range = get_frame_range(vid_or_img_files, json_dirs_names, ref_cam)
+        # get frame range using reference camera name
+        frame_range = get_frame_range(vid_or_img_files, json_dirs_names, ref_cam_name)
     
     f_range = [[0,max([len(j) for j in json_files_names])] if frame_range==[] else frame_range][0]
-    print(f"f_range: {f_range}")
     n_cams = len(json_dirs_names)
 
     # Check that camera number is consistent between calibration file and pose folders
@@ -1265,17 +1342,23 @@ def associate_all(config_dict):
                     Found {len(P_all)} cameras in the calibration file,\
                     and {n_cams} cameras based on the number of pose folders.')
     
+    prev_proposals = None  # Store previous frame's proposals
+    id_changes = [0] * n_cams  # Track ID changes for each camera
+    prev_ids = [None] * n_cams  # Store previous IDs for each camera
+
     for f in tqdm(range(*f_range)):
-        # print(f'\nFrame {f}:')
         json_files_names_f = [[j for j in json_files_names[c] if int(re.split(r'(\d+)',j)[-2])==f] for c in range(n_cams)]
         json_files_names_f = [j for j_list in json_files_names_f for j in (j_list or ['none'])]
         json_files_f = [os.path.join(json_base_dir, json_dirs_names[c], json_files_names_f[c]) for c in range(n_cams)]
         json_tracked_files_f = [os.path.join(poseTracked_dir, json_dirs_names[c], json_files_names_f[c]) for c in range(n_cams)]
 
+
+        # NOTE!: 이곳까지 OK
+
         if not multi_person:
             if use_ConvexHull and f == f_range[0]:  # First frame for ConvexHull
                 # Get initial person selection for each camera
-                selected_ids = []
+                initial_selected_ids = []
                 for cam in range(n_cams):
                     try:
                         with open(json_files_f[cam], 'r') as f_cam:
@@ -1288,12 +1371,12 @@ def associate_all(config_dict):
                                 cap.release()
                             else:  # image directory
                                 frame = cv2.imread(vid_or_img_files[cam][0])
-                            selected_id = select_person_manually(data.get('people', []), frame)
-                            if selected_id is None:
+                            initial_selected_id = select_person_manually(data.get('people', []), frame)
+                            if initial_selected_id is None:
                                 raise ValueError(f"No person selected for tracking in camera {cam+1}")
-                            selected_ids.append(selected_id)
+                            initial_selected_ids.append(initial_selected_id)
                     except:
-                        selected_ids.append(0)
+                        initial_selected_ids.append(0)
                         logging.warning(f"Failed to manually select person for camera {cam+1}, defaulting to person 0")
             
             if use_ConvexHull:
@@ -1301,13 +1384,51 @@ def associate_all(config_dict):
                 proposals = []
                 for cam in range(n_cams):
                     if f == f_range[0]:  # Use initially selected person
-                        tracked_id = selected_ids[cam]
+                        tracked_id = initial_selected_ids[cam]
+                        prev_ids[cam] = tracked_id
                     else:  # Track from previous frame
-                        tracked_id = track_with_convexhull([json_files_f[cam]], selected_ids[cam], is_last_frame=(f == f_range[-1]))
-                        if tracked_id is not None:  # Update selected_id for next frame if tracking successful
-                            selected_ids[cam] = tracked_id
+                        tracked_id = track_with_convexhull([json_files_f[cam]], initial_selected_ids[cam], image_size)
+                        prev_ids[cam] = tracked_id
                     proposals.append([tracked_id if tracked_id is not None else np.nan])
                 proposals = np.array(proposals).T
+
+                # Compare current proposals with previous frame's proposals
+                if prev_proposals is not None:
+                    for cam in range(n_cams):
+                        curr_id = proposals[0][cam]
+                        prev_id = prev_proposals[0][cam]
+                        
+                        # Check if either current or previous ID is nan
+                        curr_is_nan = np.isnan(curr_id) if isinstance(curr_id, float) else False
+                        prev_is_nan = np.isnan(prev_id) if isinstance(prev_id, float) else False
+                        
+                        # Only compare if neither is nan and they are different
+                        if not (curr_is_nan or prev_is_nan):  # 둘 다 유효한 ID인 경우만
+                            if curr_id != prev_id:  # ID가 변경된 경우
+                                # logging.warning(f"Frame {f}, Camera {cam+1}: ID changed from {int(prev_id)} to {int(curr_id)}")
+                                id_changes[cam] += 1  # Increment ID change counter
+                                prev_ids[cam] = int(curr_id)  # Update previous ID
+                        elif curr_is_nan and not prev_is_nan:  # 현재 프레임에서 추적 실패
+                            # logging.warning(f"Frame {f}, Camera {cam+1}: Lost tracking. Previous ID was {int(prev_id)}")
+                            id_changes[cam] += 1  # Count losing track as an ID change
+                        elif not curr_is_nan and prev_is_nan:  # 추적 복구
+                            # logging.warning(f"Frame {f}, Camera {cam+1}: Recovered tracking with ID {int(curr_id)}")
+                            prev_ids[cam] = int(curr_id)
+                            id_changes[cam] += 1  # Count recovering track as an ID change
+
+                # Store current proposals for next frame comparison
+                prev_proposals = proposals.copy()
+
+                # Final logging only at the last frame
+                if f == f_range[1] - 1:  # Changed from f_range[-1] to f_range[1] - 1
+                    logging.info("\n=== Final Tracking Summary ===")
+                    for cam in range(n_cams):
+                        logging.info(f"\nCamera {json_dirs_names[cam]}:")
+                        logging.info(f"  - Initial ID: {initial_selected_ids[cam]}")
+                        logging.info(f"  - Final ID: {prev_ids[cam]}")
+                        logging.info(f"  - Total ID changes: {id_changes[cam]}")
+                        if id_changes[cam] > 0:
+                            logging.warning(f"  - Warning: ID changed {id_changes[cam]} times in this camera")
             else:
                 # Original single-person tracking logic
                 personsIDs_comb = persons_combinations(json_files_f) 
@@ -1348,7 +1469,6 @@ def associate_all(config_dict):
                 pre_tracking_data.append([])
 
         # Load post-tracking data
-        post_tracking_data = []
         keypoints_array = []
         for f in range(*f_range):
             try:
